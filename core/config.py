@@ -23,6 +23,14 @@ class Settings(BaseSettings):
     google_search_api_key: Optional[str] = None
     google_search_engine_id: Optional[str] = None
     
+    # Google Calendar (optional)
+    google_calendar_token: Optional[str] = None
+    google_calendar_id: Optional[str] = None  # Default: "primary"
+    
+    # Gmail (optional)
+    google_gmail_token: Optional[str] = None
+    gmail_sender_email: Optional[str] = None
+    
     # Server Configuration
     ngrok_url: str
     server_port: int = 8000

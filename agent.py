@@ -1,7 +1,9 @@
 """Main agent orchestrating summarization, fact-checking, and MCP integrations."""
 from typing import List, Dict, Any, Optional
+from datetime import datetime
 from core.summarizer import Summarizer
 from core.fact_checker import FactChecker
+from core.intent_parser import IntentParser
 from core.utils import setup_logging, log_external_call
 from mcp.notion_mcp import create_notion_page
 from mcp.meetstream_mcp import send_chat_message
@@ -18,8 +20,10 @@ class VeriMeetAgent:
         self.bot_id = bot_id
         self.summarizer = Summarizer()
         self.fact_checker = FactChecker()
+        self.intent_parser = IntentParser()
         self.transcripts = []
         self.verified_facts = []
+        self.detected_intents = []
         self.current_summary = None
     
     def set_bot_id(self, bot_id: str):
@@ -32,7 +36,8 @@ class VeriMeetAgent:
         Process a transcript segment:
         1. Detect factual statements
         2. Verify facts and post to chat
-        3. Update summary
+        3. Detect intents (scheduling, email requests)
+        4. Update summary
         
         Args:
             transcript: Transcript text to process
@@ -75,7 +80,29 @@ class VeriMeetAgent:
                         "verification": verification_result
                     })
         
-        # 3. Update summary
+        # 3. Detect intents (scheduling, email requests)
+        intents = self.intent_parser.detect_intents(transcript, context=self.current_summary)
+        logger.info(f"Detected {len(intents)} intents")
+        
+        # Process each intent
+        for intent in intents:
+            intent_type = intent.get("type")
+            confidence = intent.get("confidence", "low")
+            
+            # Only process high/medium confidence intents
+            if confidence in ["high", "medium"]:
+                self.detected_intents.append(intent)
+                
+                if intent_type == "schedule":
+                    logger.info(f"Scheduling intent detected: {intent.get('action')}")
+                    # Will be handled by Calendar MCP
+                    self._handle_schedule_intent(intent)
+                elif intent_type == "email":
+                    logger.info(f"Email intent detected: {intent.get('action')}")
+                    # Will be handled by Gmail MCP
+                    self._handle_email_intent(intent)
+        
+        # 4. Update summary
         self.current_summary = self.summarizer.summarize(
             transcript,
             previous_summary=self.current_summary
@@ -85,8 +112,91 @@ class VeriMeetAgent:
         return {
             "facts_detected": len(facts),
             "facts_verified": len(self.verified_facts),
+            "intents_detected": len(intents),
             "summary_length": len(self.current_summary)
         }
+    
+    def _handle_schedule_intent(self, intent: Dict[str, Any]):
+        """Handle a scheduling intent by creating a calendar event."""
+        try:
+            from mcp.calendar_mcp import create_calendar_event
+            
+            details = intent.get("details", {})
+            action = intent.get("action", "Schedule meeting")
+            
+            # Extract event information
+            title = details.get("topic") or action
+            date = details.get("date") or intent.get("parsed_datetime", {}).get("date")
+            time = details.get("time") or intent.get("parsed_datetime", {}).get("time")
+            description = intent.get("context", "")
+            
+            result = create_calendar_event(
+                title=title,
+                date=date,
+                time=time,
+                description=description
+            )
+            
+            if result.get("success"):
+                logger.info(f"Created calendar event: {result.get('event_id')}")
+                # Post confirmation to chat
+                if self.bot_id:
+                    chat_message = f"✅ Calendar event created: {title}"
+                    if date:
+                        chat_message += f" on {date}"
+                    if time:
+                        chat_message += f" at {time}"
+                    send_chat_message(self.bot_id, chat_message)
+            else:
+                logger.error(f"Failed to create calendar event: {result.get('error')}")
+        
+        except ImportError:
+            logger.warning("Calendar MCP not available - scheduling intent not processed")
+        except Exception as e:
+            logger.error(f"Error handling schedule intent: {e}", exc_info=True)
+    
+    def _handle_email_intent(self, intent: Dict[str, Any]):
+        """Handle an email intent by sending the summary."""
+        try:
+            from mcp.gmail_mcp import send_email_summary
+            
+            details = intent.get("details", {})
+            recipients = details.get("recipients", [])
+            
+            # If no recipients specified, use a default or ask
+            if not recipients:
+                logger.warning("No recipients specified for email intent")
+                if self.bot_id:
+                    send_chat_message(
+                        self.bot_id,
+                        "📧 Email requested but no recipients specified. Please provide email addresses."
+                    )
+                return
+            
+            # Get current summary
+            summary = self.current_summary or "Meeting summary not yet available."
+            
+            result = send_email_summary(
+                recipients=recipients,
+                subject=f"Meeting Summary - {datetime.now().strftime('%Y-%m-%d')}",
+                summary=summary,
+                verified_facts=self.verified_facts
+            )
+            
+            if result.get("success"):
+                logger.info(f"Email sent to {recipients}")
+                if self.bot_id:
+                    send_chat_message(
+                        self.bot_id,
+                        f"✅ Email summary sent to {', '.join(recipients)}"
+                    )
+            else:
+                logger.error(f"Failed to send email: {result.get('error')}")
+        
+        except ImportError:
+            logger.warning("Gmail MCP not available - email intent not processed")
+        except Exception as e:
+            logger.error(f"Error handling email intent: {e}", exc_info=True)
     
     def finalize_meeting(self, meeting_title: str = None) -> Dict[str, Any]:
         """

@@ -1,15 +1,45 @@
 """FastAPI server entry point for VeriMeet - handles Meetstream WebSocket callbacks."""
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import json
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, List
 from agent import get_or_create_agent
 from core.utils import setup_logging, log_external_call
 from mcp.meetstream_mcp import create_bot
 
 logger = setup_logging()
 app = FastAPI(title="VeriMeet API", version="0.1.0")
+
+# CORS middleware for frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://localhost:3001"],  # Next.js default ports
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Store active WebSocket connections
+active_connections: List[WebSocket] = []
+
+async def broadcast_message(message: Dict[str, Any]):
+    """Broadcast a message to all connected WebSocket clients."""
+    if active_connections:
+        message_json = json.dumps(message)
+        disconnected = []
+        for connection in active_connections:
+            try:
+                await connection.send_text(message_json)
+            except Exception as e:
+                logger.error(f"Error sending message to WebSocket: {e}")
+                disconnected.append(connection)
+        
+        # Remove disconnected connections
+        for conn in disconnected:
+            if conn in active_connections:
+                active_connections.remove(conn)
 
 
 @app.get("/")
@@ -42,6 +72,35 @@ async def meetstream_webhook(request: Request):
                 agent = get_or_create_agent(bot_id=bot_id)
                 result = agent.process_transcript(transcript, meeting_id=meeting_id)
                 logger.info(f"Processed transcript: {result}")
+                
+                # Broadcast to WebSocket clients
+                await broadcast_message({
+                    "type": "transcript",
+                    "data": {"text": transcript, "bot_id": bot_id}
+                })
+                
+                # Broadcast facts if any
+                if result.get("facts_verified", 0) > 0:
+                    for fact in agent.verified_facts[-result.get("facts_verified", 0):]:
+                        await broadcast_message({
+                            "type": "fact",
+                            "data": fact
+                        })
+                
+                # Broadcast intents if any
+                if result.get("intents_detected", 0) > 0:
+                    for intent in agent.detected_intents[-result.get("intents_detected", 0):]:
+                        await broadcast_message({
+                            "type": "intent",
+                            "data": intent
+                        })
+                
+                # Broadcast summary update
+                if agent.current_summary:
+                    await broadcast_message({
+                        "type": "summary",
+                        "data": {"summary": agent.current_summary}
+                    })
         
         elif event_type == "meeting_ended":
             # Finalize meeting
@@ -139,22 +198,37 @@ async def get_current_summary():
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """
-    WebSocket endpoint for real-time communication (if needed).
-    Currently, Meetstream uses webhooks, but this can be used for client connections.
+    WebSocket endpoint for real-time communication with frontend.
+    Broadcasts meeting events (transcripts, facts, intents, summaries) to connected clients.
     """
     await websocket.accept()
-    logger.info("WebSocket connection established")
+    active_connections.append(websocket)
+    logger.info(f"WebSocket connection established. Total connections: {len(active_connections)}")
     
     try:
+        # Send initial connection confirmation
+        await websocket.send_json({
+            "type": "status",
+            "data": {"status": "connected", "message": "Connected to VeriMeet"}
+        })
+        
         while True:
             data = await websocket.receive_text()
-            message = json.loads(data)
-            
-            # Handle WebSocket messages if needed
-            await websocket.send_json({"status": "received", "message": message})
+            try:
+                message = json.loads(data)
+                # Handle incoming messages if needed
+                logger.debug(f"Received WebSocket message: {message}")
+            except json.JSONDecodeError:
+                logger.warning(f"Invalid JSON received: {data}")
     
     except WebSocketDisconnect:
-        logger.info("WebSocket disconnected")
+        if websocket in active_connections:
+            active_connections.remove(websocket)
+        logger.info(f"WebSocket disconnected. Remaining connections: {len(active_connections)}")
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}", exc_info=True)
+        if websocket in active_connections:
+            active_connections.remove(websocket)
 
 
 if __name__ == "__main__":
